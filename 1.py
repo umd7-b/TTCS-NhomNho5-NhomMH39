@@ -1,7 +1,4 @@
 """
-BÁO CÁO TUẦN 5 - THỰC TẬP CƠ SỞ
-Đề tài: Thuật toán ANN để nhận diện biển số xe
-Nhóm 39 | PTIT - Khoa CNTT1
 
 BƯỚC 1: Phân loại có phải biển số xe Việt Nam không
   - Label 1 = Có biển số xe (crop đúng vùng biển số)
@@ -20,10 +17,6 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
 
-# ============================================================
-# BƯỚC 1: TIỀN XỬ LÝ ẢNH
-# ============================================================
-
 def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None:
@@ -35,7 +28,6 @@ def preprocess_image(image_path):
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     return img, gray, blurred, binary, contours
-
 
 def visualize_preprocessing(image_path):
     img, gray, blurred, binary, _ = preprocess_image(image_path)
@@ -50,11 +42,6 @@ def visualize_preprocessing(image_path):
     plt.show()
     print("Đã lưu: preprocessing_steps.png")
 
-
-# ============================================================
-# BƯỚC 2: CROP & CHUẨN HÓA
-# ============================================================
-
 IMG_WIDTH  = 64
 IMG_HEIGHT = 64
 
@@ -67,7 +54,6 @@ def crop_license_plate(image_path, bbox):
     y2 = min(img.shape[0], y + h + pad)
     return img[y1:y2, x1:x2]
 
-
 def normalize_plate(plate_crop):
     h, w   = plate_crop.shape[:2]
     if h == 0 or w == 0:
@@ -79,35 +65,48 @@ def normalize_plate(plate_crop):
     x_off   = (IMG_WIDTH  - new_w) // 2
     y_off   = (IMG_HEIGHT - new_h) // 2
     canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
-    gray       = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    
+    hog = cv2.HOGDescriptor((64, 64), (16, 16), (8, 8), (8, 8), 9)
+    features = hog.compute(gray).flatten()
+    
     normalized = gray.astype(np.float32) / 255.0
-    return normalized.flatten(), normalized
-
+    return features, normalized
 
 def augment_image(img):
-    """Augment ảnh: Chỉ tạo 2 bản (Gốc và Đảo màu) để train cho lẹ!"""
+    """Augment ảnh: noise, sáng/tối, blur, và đảo màu (Biển Xanh/Đỏ)"""
     augments = [img]
 
+    # Gaussian noise
+    noise = np.random.normal(0, 15, img.shape).astype(np.float32)
+    augments.append(np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8))
+
+    # Tối đi
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv_dark = hsv.copy(); hsv_dark[:,:,2] = np.clip(hsv_dark[:,:,2] * 0.7, 0, 255)
+    augments.append(cv2.cvtColor(hsv_dark.astype(np.uint8), cv2.COLOR_HSV2BGR))
+
+    # Sáng lên
+    hsv_bright = hsv.copy(); hsv_bright[:,:,2] = np.clip(hsv_bright[:,:,2] * 1.3, 0, 255)
+    augments.append(cv2.cvtColor(hsv_bright.astype(np.uint8), cv2.COLOR_HSV2BGR))
+
+    # Blur
+    augments.append(cv2.GaussianBlur(img, (3, 3), 0))
+    
     # Đảo màu (Invert Colors) -> Giúp model học nhận diện Biển Xanh/Đỏ
     inverted = cv2.bitwise_not(img)
     augments.append(inverted)
     
     return augments
 
-
-# ============================================================
-# BƯỚC 2 MỚI: LOAD DATASET NHỊ PHÂN
-# Label 1 = Có biển số xe VN
-# Label 0 = Không phải biển số xe
-# ============================================================
-
-def generate_negative_crop(img, plate_bbox, num_neg=2):
+def generate_negative_crop(img, bbox, num_neg=1):
     h_img, w_img = img.shape[:2]
-    px, py, pw, ph = [int(v) for v in plate_bbox]
+    px, py, pw, ph = [int(v) for v in bbox]
     results = []
     attempts = 0
 
-    # Đảm bảo kích thước crop hợp lệ
     cw_min = 20
     cw_max = max(cw_min + 1, min(pw * 2, w_img // 2))
     ch_min = 10
@@ -115,19 +114,17 @@ def generate_negative_crop(img, plate_bbox, num_neg=2):
 
     while len(results) < num_neg and attempts < 50:
         attempts += 1
-        cw = random.randint(cw_min, cw_max)
-        ch = random.randint(ch_min, ch_max)
+        cw = np.random.randint(cw_min, cw_max)
+        ch = np.random.randint(ch_min, ch_max)
 
-        # Đảm bảo vị trí crop không vượt khỏi ảnh
         cx_max = max(0, w_img - cw)
         cy_max = max(0, h_img - ch)
         if cx_max == 0 or cy_max == 0:
             continue
 
-        cx = random.randint(0, cx_max)
-        cy = random.randint(0, cy_max)
+        cx = np.random.randint(0, cx_max)
+        cy = np.random.randint(0, cy_max)
 
-        # Kiểm tra không overlap với biển số
         no_overlap_x = (cx + cw < px) or (cx > px + pw)
         no_overlap_y = (cy + ch < py) or (cy > py + ph)
 
@@ -137,6 +134,23 @@ def generate_negative_crop(img, plate_bbox, num_neg=2):
                 results.append(crop)
 
     return results
+
+def generate_hard_negative_crops(img, bbox):
+    """Cố tình cắt nửa biển số làm mẫu sai (Hard Negative), ép AI học cấu trúc TOÀN BỘ biển số"""
+    x, y, w, h = [int(v) for v in bbox]
+    crops = []
+    w_half = w // 2
+    h_half = h // 2
+    if w_half > 10 and h_half > 10:
+        crops.append(img[y:y+h, x:x+w_half])
+        crops.append(img[y:y+h, x+w_half:x+w])
+        crops.append(img[y:y+h_half, x:x+w])
+        crops.append(img[y+h_half:y+h, x:x+w])
+    return crops
+
+def augment_image_negative(img):
+    """Augment ảnh rác (Chỉ lấy Gốc và Đảo Màu để tiết kiệm RAM tối đa)"""
+    return [img, cv2.bitwise_not(img)]
 
 
 def load_dataset_binary(img_dir, annotation_file, augment=False):
@@ -184,11 +198,21 @@ def load_dataset_binary(img_dir, annotation_file, augment=False):
                 X.append(flat)
                 y.append(1)
 
-        # ❌ NEGATIVE: crop vùng ngẫu nhiên không phải biển số (Chỉ sinh 1ảnh và KHÔNG AUGMENT để giảm bộ nhớ chạy)
         neg_crops = generate_negative_crop(img, ann['bbox'], num_neg=1)
         for neg in neg_crops:
-            # Luôn không augment ảnh negative để giảm tải
-            neg_samples = [neg]
+            # ✅ Bật lại Augment cho Mẫu Rác để Model luyện mắt 
+            neg_samples = augment_image_negative(neg) if augment else [neg]
+            for s in neg_samples:
+                flat, _ = normalize_plate(s)
+                if flat is not None:
+                    X.append(flat)
+                    y.append(0)
+                    
+        # ❌ HARD NEGATIVES: Ép model học nhận biết biển số bị cắt thiếu nét
+        hard_negs = generate_hard_negative_crops(img, ann['bbox'])
+        for neg in hard_negs:
+            # ✅ Bật lại Augment cho Rác Khó luôn!
+            neg_samples = augment_image_negative(neg) if augment else [neg]
             for s in neg_samples:
                 flat, _ = normalize_plate(s)
                 if flat is not None:
@@ -202,11 +226,6 @@ def load_dataset_binary(img_dir, annotation_file, augment=False):
           f"Negative: {neg_count} | "
           f"Skipped: {skipped}")
     return np.array(X), np.array(y), class_names
-
-
-# ============================================================
-# BƯỚC 3: XÂY DỰNG ANN BẰNG NUMPY THUẦN
-# ============================================================
 
 def relu(z):
     return np.maximum(0, z)
@@ -240,11 +259,6 @@ def build_ann_model(input_dim, num_classes):
     print(f"Tổng số layers: {num_layers}")
     return params, num_layers
 
-
-# ============================================================
-# BƯỚC 4: HUẤN LUYỆN
-# ============================================================
-
 def forward_pass(X, params, num_layers):
     cache = {'A0': X}
     A = X
@@ -255,25 +269,31 @@ def forward_pass(X, params, num_layers):
         cache[f'A{l}'] = A
     return A, cache
 
-
-def compute_loss(y_pred, y_true):
+def compute_loss(y_pred, y_true, params=None, lambda_reg=0.01):
     m = y_true.shape[0]
     y_clip = np.clip(y_pred, 1e-15, 1 - 1e-15)
-    return -np.sum(y_true * np.log(y_clip)) / m
+    loss = -np.sum(y_true * np.log(y_clip)) / m
+    
+    if params is not None:
+        l2_cost = 0
+        num_layers = len([k for k in params if k.startswith('W')])
+        for l in range(1, num_layers + 1):
+            l2_cost += np.sum(np.square(params[f'W{l}']))
+        loss += (lambda_reg / (2 * m)) * l2_cost
+        
+    return loss
 
-
-def backward_pass(y_true, params, cache, num_layers):
+def backward_pass(y_true, params, cache, num_layers, lambda_reg=0.01):
     grads = {}
     m  = y_true.shape[0]
     dA = cache[f'A{num_layers}'] - y_true
     for l in reversed(range(1, num_layers + 1)):
         A_prev = cache[f'A{l-1}']
-        grads[f'dW{l}'] = (A_prev.T @ dA) / m
+        grads[f'dW{l}'] = (A_prev.T @ dA) / m + (lambda_reg / m) * params[f'W{l}']
         grads[f'db{l}'] = np.sum(dA, axis=0, keepdims=True) / m
         if l > 1:
             dA = (dA @ params[f'W{l}'].T) * relu_grad(cache[f'Z{l-1}'])
     return grads
-
 
 def init_adam(params):
     adam = {}
@@ -281,7 +301,6 @@ def init_adam(params):
         adam[f'm_{key}'] = np.zeros_like(params[key])
         adam[f'v_{key}'] = np.zeros_like(params[key])
     return adam
-
 
 def update_adam(params, grads, adam, t,
                 lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
@@ -295,7 +314,6 @@ def update_adam(params, grads, adam, t,
             v_hat = adam[f'v_{key}'] / (1 - beta2**t)
             params[key] -= lr * m_hat / (np.sqrt(v_hat) + eps)
     return params, adam
-
 
 def train_model(params, num_layers, X_train, y_train, X_val, y_val,
                 num_classes, epochs=50, batch_size=32):
@@ -324,8 +342,8 @@ def train_model(params, num_layers, X_train, y_train, X_val, y_val,
 
         yp_tr, _ = forward_pass(X_train, params, num_layers)
         yp_vl, _ = forward_pass(X_val,   params, num_layers)
-        tr_loss  = compute_loss(yp_tr, y_train_cat)
-        vl_loss  = compute_loss(yp_vl, y_val_cat)
+        tr_loss  = compute_loss(yp_tr, y_train_cat, params=params, lambda_reg=0.01)
+        vl_loss  = compute_loss(yp_vl, y_val_cat, params=params, lambda_reg=0.01)
         tr_acc   = np.mean(np.argmax(yp_tr, 1) == y_train)
         vl_acc   = np.mean(np.argmax(yp_vl, 1) == y_val)
 
@@ -358,7 +376,6 @@ def train_model(params, num_layers, X_train, y_train, X_val, y_val,
 
     return best_params, history
 
-
 def plot_training_history(history):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(history['accuracy'],     label='Train Accuracy', linewidth=2)
@@ -377,11 +394,6 @@ def plot_training_history(history):
     plt.savefig("training_history.png", dpi=150, bbox_inches='tight')
     plt.show()
     print("Đã lưu: training_history.png")
-
-
-# ============================================================
-# BƯỚC 5: ĐÁNH GIÁ
-# ============================================================
 
 def evaluate_model(params, num_layers, X_test, y_test,
                    num_classes, class_names):
@@ -411,11 +423,6 @@ def evaluate_model(params, num_layers, X_test, y_test,
     print("Đã lưu: confusion_matrix.png")
     return test_accuracy, y_pred
 
-
-# ============================================================
-# MAIN
-# ============================================================
-
 if __name__ == "__main__":
     TRAIN_DIR = "dataset/train"; TRAIN_ANN = "dataset/train/_annotations.coco.json"
     VALID_DIR = "dataset/valid"; VALID_ANN = "dataset/valid/_annotations.coco.json"
@@ -430,7 +437,7 @@ if __name__ == "__main__":
     X_val,   y_val,   _           = load_dataset_binary(VALID_DIR, VALID_ANN, augment=False)
     X_test,  y_test,  _           = load_dataset_binary(TEST_DIR,  TEST_ANN,  augment=False)
 
-    num_classes = 2          # 0: không phải BSX, 1: có BSX
+    num_classes = 2
     input_dim   = X_train.shape[1]
     print(f"\nTrain: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
 
@@ -444,6 +451,10 @@ if __name__ == "__main__":
         X_val,   y_val,
         num_classes, epochs=50, batch_size=32
     )
+    
+    np.save("ann_biensoxe_b1.npy", best_params)
+    print("\nĐã lưu model: ann_biensoxe_b1.npy")
+    
     plot_training_history(history)
 
     print("\n[Bước 5] Đánh giá trên tập Test...")
@@ -452,6 +463,4 @@ if __name__ == "__main__":
         X_test, y_test, num_classes, class_names
     )
 
-    np.save("ann_biensoxe_b1.npy", best_params)
-    print("\nĐã lưu model: ann_biensoxe_b1.npy")
     print("Hoàn thành Bước 1!")

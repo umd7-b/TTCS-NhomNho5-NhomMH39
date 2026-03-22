@@ -2,4 +2,3 @@ dataset/
 __pycache__/
 *.npy
 *.png
-app.py
