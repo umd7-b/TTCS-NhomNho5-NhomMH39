@@ -243,10 +243,7 @@ def to_categorical(y, num_classes):
     return one_hot
 
 def build_ann_model(input_dim, num_classes):
-    """
-    Kiến trúc: input → 256 → 128 → 64 → 2
-    output: [P(không phải BSX), P(có BSX)]
-    """
+    
     layer_sizes = [input_dim, 256, 128, 64, num_classes]
     params = {}
     for l in range(1, len(layer_sizes)):
@@ -427,9 +424,9 @@ if __name__ == "__main__":
     TRAIN_DIR = "dataset/train"; TRAIN_ANN = "dataset/train/_annotations.coco.json"
     VALID_DIR = "dataset/valid"; VALID_ANN = "dataset/valid/_annotations.coco.json"
     TEST_DIR  = "dataset/test";  TEST_ANN  = "dataset/test/_annotations.coco.json"
-
+  
     print("=" * 60)
-    print("BƯỚC 1: PHÂN LOẠI CÓ/KHÔNG PHẢI BIỂN SỐ XE VN")
+    print("BƯỚC 1: PHÂN LOẠI CÓ/KHÔNG PHẢI BIỂN SỐ XE")
     print("=" * 60)
 
     print("\n[Bước 2] Load dataset nhị phân (augment train)...")
