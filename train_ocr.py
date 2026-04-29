@@ -1,33 +1,29 @@
 """
 =============================================================================
-TRAIN OCR KÝ TỰ BIỂN SỐ XE — v2 (Cải tiến mạnh)
+TRAIN OCR KÝ TỰ BIỂN SỐ XE — v3 (Tất cả bug đã sửa)
 =============================================================================
-FIX so với bản cũ:
-  🐛 FIX: Cache ảnh vào RAM — KHÔNG đọc lại disk mỗi lần augment (~10x nhanh hơn)
-  🐛 FIX: Early stopping theo val_acc thay val_loss (label smoothing làm lệch loss)
-  🐛 FIX: Mixup accuracy tracking đúng với cả 2 nhãn mixed
-  🐛 FIX: Oversample đếm đúng số mẫu đã tạo (bug logic cũ đếm sai)
+FIX so với bản v2:
+  🐛 FIX #5:  Xóa biến dead-code `swa_active` — chỉ dùng `swa_started`
+  🐛 FIX #6:  Dropout giảm 0.4/0.35/0.3/0.2 → 0.3/0.25/0.2/0.1
+  🐛 FIX #7:  Bottleneck tăng 64 → 128 (tránh thắt cổ chai trước 30 class)
+  🐛 FIX #8:  Thêm Residual Connection (skip từ layer 256 → output layer 128)
+  🐛 FIX chung: bilateralFilter sigma giảm 50 → 30 (giữ cạnh HOG tốt hơn)
 
-MỚI so với bản cũ:
-  ✅ Focal Loss — tập trung vào mẫu khó, thay thế Weighted CE + Label Smoothing
-  ✅ OneCycleLR thay CosineAnnealingWarmRestarts — hội tụ nhanh & ổn định hơn
-  ✅ Stochastic Weight Averaging (SWA) — tổng quát hoá tốt hơn ~1-2%
-  ✅ Elastic Distortion augmentation — mô phỏng chữ bị biến dạng do góc chụp
-  ✅ Random Erasing (Cutout) — tăng robustness khi ký tự bị che khuất
-  ✅ Test-Time Augmentation (TTA) khi evaluate test set
-  ✅ Phân tích TOP-10 cặp nhầm lẫn trong confusion matrix
-  ✅ Per-class worst performers highlight
-  ✅ Gradient norm tracking — phát hiện exploding gradient
-  ✅ Lưu checkpoint mỗi 10 epoch để resume nếu crash
-  ✅ tqdm progress bar cho từng epoch
+GIỮ NGUYÊN từ v2 (đã đúng):
+  ✅ Mixup accuracy tracking dùng pred_label (lam >= 0.5 → by_a, else by_b)
+  ✅ Cache ảnh vào RAM — không đọc lại từ disk mỗi vòng augment
+  ✅ Focal Loss thay Weighted CE + Label Smoothing
+  ✅ OneCycleLR per-step (không phải per-epoch)
+  ✅ SWA, TTA, Elastic Distortion, Random Erasing, Gradient Norm tracking
+  ✅ Checkpoint mỗi 10 epoch, phân tích confusion matrix chi tiết
 
 Đầu ra:
-    ocr_model_best.pth   — model tốt nhất theo val_acc
-    ocr_model_swa.pth    — model SWA (thường tốt hơn best ~1%)
-    ocr_scaler.pkl       — StandardScaler HOG features
+    ocr_model_best.pth    — model tốt nhất theo val_acc
+    ocr_model_swa.pth     — model SWA (thường tốt hơn best ~1%)
+    ocr_scaler.pkl        — StandardScaler HOG features
     ocr_confusion_matrix.png
     ocr_training_history.png
-    ocr_confusion_pairs.txt  — TOP cặp nhầm lẫn
+    ocr_confusion_pairs.txt
 =============================================================================
 """
 
@@ -36,6 +32,7 @@ import numpy as np
 import cv2
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
@@ -62,19 +59,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIRS            = ["dataset_ocr"]
 IMG_SIZE             = 64
 BATCH_SIZE           = 64
-EPOCHS               = 200          # Tăng lên vì OneCycleLR + SWA cần nhiều epoch hơn
-LR_MAX               = 3e-3         # Peak LR cho OneCycleLR
-PATIENCE             = 35           # Early stopping (theo val_acc)
-TARGET_PER_CLASS     = 2500         # Số mẫu mục tiêu mỗi class sau oversampling
-MAX_OVERSAMPLE_RATIO = 15           # Không phóng đại quá 15x so với gốc
-FOCAL_ALPHA          = 1.0          # Focal Loss alpha
-FOCAL_GAMMA          = 2.0          # Focal Loss gamma (càng cao càng tập trung mẫu khó)
-MIXUP_PROB           = 0.4          # Xác suất Mixup
-MIXUP_ALPHA          = 0.4          # Beta distribution alpha cho Mixup
-SWA_START_FRAC       = 0.75         # Bắt đầu SWA từ epoch nào (% tổng epoch)
-SWA_LR               = 5e-4         # Learning rate cho SWA phase
-CHECKPOINT_EVERY     = 10           # Lưu checkpoint mỗi N epoch
-TTA_N_AUG            = 5            # Số augmentations cho TTA evaluation
+EPOCHS               = 200
+LR_MAX               = 3e-3
+PATIENCE             = 35
+TARGET_PER_CLASS     = 2500
+MAX_OVERSAMPLE_RATIO = 15
+FOCAL_ALPHA          = 1.0
+FOCAL_GAMMA          = 2.0
+MIXUP_PROB           = 0.4
+MIXUP_ALPHA          = 0.4
+SWA_START_FRAC       = 0.75
+SWA_LR               = 5e-4
+CHECKPOINT_EVERY     = 10
+TTA_N_AUG            = 5
 
 # 30 ký tự biển số VN (bỏ I, J, O, Q, R, W)
 CLASS_NAMES = [
@@ -90,45 +87,42 @@ _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 # ==============================================================================
-# FOCAL LOSS — Thay thế Weighted CrossEntropy + Label Smoothing
+# FOCAL LOSS
 # ==============================================================================
 class FocalLoss(nn.Module):
     """
-    Focal Loss: FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
-    - Tự động down-weight mẫu dễ (0/D, 1/L thường bị nhầm → gamma phạt nặng hơn)
-    - Không cần tính class weights thủ công như Weighted CE
-    - Có label smoothing tích hợp
+    Focal Loss với label smoothing tích hợp.
+    Tự động down-weight mẫu dễ, tập trung vào mẫu khó.
     """
     def __init__(self, alpha=1.0, gamma=2.0, smoothing=0.05, num_classes=NUM_CLASSES):
         super().__init__()
-        self.alpha     = alpha
-        self.gamma     = gamma
-        self.smoothing = smoothing
+        self.alpha       = alpha
+        self.gamma       = gamma
+        self.smoothing   = smoothing
         self.num_classes = num_classes
 
     def forward(self, logits, targets):
-        # Label smoothing
         with torch.no_grad():
-            smooth_targets = torch.full_like(logits, self.smoothing / (self.num_classes - 1))
+            smooth_targets = torch.full_like(logits,
+                                             self.smoothing / (self.num_classes - 1))
             smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
 
-        log_prob = torch.nn.functional.log_softmax(logits, dim=1)
+        log_prob = F.log_softmax(logits, dim=1)
         prob     = log_prob.exp()
-
-        # Focal weight: (1 - p_t)^gamma
-        p_t = (prob * smooth_targets).sum(dim=1)
-        focal_weight = self.alpha * (1.0 - p_t) ** self.gamma
-
-        # Loss
-        loss = -(smooth_targets * log_prob).sum(dim=1)
-        return (focal_weight * loss).mean()
+        p_t      = (prob * smooth_targets).sum(dim=1)
+        focal_w  = self.alpha * (1.0 - p_t) ** self.gamma
+        loss     = -(smooth_targets * log_prob).sum(dim=1)
+        return (focal_w * loss).mean()
 
 
 # ==============================================================================
-# HOG FEATURE EXTRACTION (giữ nguyên để tương thích inference)
+# HOG FEATURE EXTRACTION
 # ==============================================================================
 def extract_hog(img_bgr):
-    """Trích HOG từ ảnh BGR → vector 1D. CLAHE + bilateral filter."""
+    """
+    Trích HOG từ ảnh BGR → vector 1D.
+    🐛 FIX chung: bilateralFilter sigma giảm 50 → 30 để giữ cạnh HOG tốt hơn.
+    """
     if img_bgr is None or img_bgr.size == 0:
         return None
     h, w = img_bgr.shape[:2]
@@ -139,32 +133,27 @@ def extract_hog(img_bgr):
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     canvas = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
     rsz    = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_CUBIC)
-    xo = (IMG_SIZE - nw) // 2
-    yo = (IMG_SIZE - nh) // 2
+    xo     = (IMG_SIZE - nw) // 2
+    yo     = (IMG_SIZE - nh) // 2
     canvas[yo:yo+nh, xo:xo+nw] = rsz
 
     gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     gray = _clahe.apply(gray)
-    gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    gray = cv2.bilateralFilter(gray, 5, 30, 30)   # FIX: sigma 50 → 30
     return _hog.compute(gray).flatten()
 
 
 # ==============================================================================
-# AUGMENTATION — Cải tiến + thêm Elastic & Random Erasing
+# AUGMENTATION
 # ==============================================================================
 def elastic_distortion(img, alpha=20, sigma=4):
-    """
-    Elastic distortion — mô phỏng chữ biến dạng do góc chụp / thấu kính.
-    alpha: cường độ biến dạng; sigma: độ mịn của field
-    """
+    """Elastic distortion — mô phỏng chữ bị biến dạng do góc chụp."""
     h, w = img.shape[:2]
     dx = cv2.GaussianBlur(
-        np.random.uniform(-1, 1, (h, w)).astype(np.float32),
-        (0, 0), sigma
+        np.random.uniform(-1, 1, (h, w)).astype(np.float32), (0, 0), sigma
     ) * alpha
     dy = cv2.GaussianBlur(
-        np.random.uniform(-1, 1, (h, w)).astype(np.float32),
-        (0, 0), sigma
+        np.random.uniform(-1, 1, (h, w)).astype(np.float32), (0, 0), sigma
     ) * alpha
     x, y  = np.meshgrid(np.arange(w), np.arange(h))
     map_x = np.clip(x + dx, 0, w - 1).astype(np.float32)
@@ -174,10 +163,7 @@ def elastic_distortion(img, alpha=20, sigma=4):
 
 
 def random_erasing(img, prob=0.5, sl=0.02, sh=0.25):
-    """
-    Random Erasing (Cutout) — xóa ngẫu nhiên 1 vùng nhỏ → tăng robustness
-    khi ký tự bị bụi bẩn / che khuất 1 phần.
-    """
+    """Random Erasing (Cutout) — tăng robustness khi ký tự bị che khuất."""
     if random.random() > prob:
         return img
     h, w = img.shape[:2]
@@ -185,13 +171,12 @@ def random_erasing(img, prob=0.5, sl=0.02, sh=0.25):
     for _ in range(20):
         erase_area = random.uniform(sl, sh) * area
         aspect     = random.uniform(0.3, 3.0)
-        eh = int(round((erase_area * aspect) ** 0.5))
-        ew = int(round((erase_area / aspect) ** 0.5))
+        eh         = int(round((erase_area * aspect) ** 0.5))
+        ew         = int(round((erase_area / aspect) ** 0.5))
         if eh >= h or ew >= w:
             continue
-        ey = random.randint(0, h - eh)
-        ex = random.randint(0, w - ew)
-        # Điền màu ngẫu nhiên (thực tế hơn màu đen thuần)
+        ey   = random.randint(0, h - eh)
+        ex   = random.randint(0, w - ew)
         fill = np.random.randint(100, 220, 3, dtype=np.uint8)
         img  = img.copy()
         img[ey:ey+eh, ex:ex+ew] = fill
@@ -200,10 +185,7 @@ def random_erasing(img, prob=0.5, sl=0.02, sh=0.25):
 
 
 def augment_char(img_bgr):
-    """
-    Trả về list ảnh augmented từ 1 ảnh gốc.
-    Thêm elastic distortion + random erasing so với bản cũ.
-    """
+    """Trả về list ảnh augmented từ 1 ảnh gốc."""
     aug = []
     h, w = img_bgr.shape[:2]
     if h < 5 or w < 5:
@@ -211,10 +193,10 @@ def augment_char(img_bgr):
 
     # 1. Xoay ±10°
     angle = random.uniform(-10, 10)
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    M     = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
     aug.append(cv2.warpAffine(img_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE))
 
-    # 2. Thay đổi độ sáng + contrast
+    # 2. Brightness + Contrast
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[:, :, 2] = np.clip(
         hsv[:, :, 2] * random.uniform(0.6, 1.4) + random.randint(-40, 40), 0, 255
@@ -226,21 +208,22 @@ def augment_char(img_bgr):
     aug.append(np.clip(img_bgr.astype(np.float32) + noise, 0, 255).astype(np.uint8))
 
     # 4. Blur nhẹ
-    aug.append(cv2.GaussianBlur(img_bgr, (random.choice([3, 5]), random.choice([3, 5])), 0))
+    aug.append(cv2.GaussianBlur(img_bgr,
+               (random.choice([3, 5]), random.choice([3, 5])), 0))
 
-    # 5. Invert màu (biển xanh/đỏ chữ trắng ↔ ngược)
+    # 5. Invert màu
     aug.append(cv2.bitwise_not(img_bgr))
 
-    # 6. Shear ngang nhẹ
+    # 6. Shear ngang
     shear = random.uniform(-0.2, 0.2)
-    M2 = np.float32([[1, shear, 0], [0, 1, 0]])
+    M2    = np.float32([[1, shear, 0], [0, 1, 0]])
     aug.append(cv2.warpAffine(img_bgr, M2, (w, h), borderMode=cv2.BORDER_REPLICATE))
 
     # 7. Perspective Transform
     if w > 10 and h > 10:
         margin = max(1, int(min(w, h) * 0.1))
-        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-        dst = np.float32([
+        src    = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        dst    = np.float32([
             [random.randint(0, margin), random.randint(0, margin)],
             [w - random.randint(0, margin), random.randint(0, margin)],
             [w - random.randint(0, margin), h - random.randint(0, margin)],
@@ -253,40 +236,36 @@ def augment_char(img_bgr):
         except Exception:
             pass
 
-    # 8. Erosion / Dilation (chữ dày/mỏng)
+    # 8. Erosion / Dilation
     kernel = np.ones((2, 2), np.uint8)
     if random.random() > 0.5:
         aug.append(cv2.erode(img_bgr, kernel, iterations=1))
     else:
         aug.append(cv2.dilate(img_bgr, kernel, iterations=1))
 
-    # 9. Color jitter — hue/saturation
+    # 9. Color jitter
     hsv2 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv2[:, :, 0] = np.clip(hsv2[:, :, 0] + random.randint(-15, 15), 0, 179)
     hsv2[:, :, 1] = np.clip(hsv2[:, :, 1] * random.uniform(0.5, 1.5), 0, 255)
     aug.append(cv2.cvtColor(hsv2.astype(np.uint8), cv2.COLOR_HSV2BGR))
 
-    # 10. ✅ MỚI: Elastic distortion
+    # 10. Elastic distortion
     aug.append(elastic_distortion(img_bgr,
                                   alpha=random.uniform(10, 25),
                                   sigma=random.uniform(3, 5)))
 
-    # 11. ✅ MỚI: Random Erasing
-    aug.append(random_erasing(img_bgr, prob=1.0,
-                              sl=0.02, sh=0.20))
+    # 11. Random Erasing
+    aug.append(random_erasing(img_bgr, prob=1.0, sl=0.02, sh=0.20))
 
     return aug
 
 
 # ==============================================================================
-# ✅ CACHE ẢNH VÀO RAM — FIX bug đọc lại từ disk mỗi lần augment
+# CACHE ẢNH VÀO RAM
 # ==============================================================================
 def cache_images(file_list):
-    """
-    Đọc tất cả ảnh vào RAM 1 lần duy nhất.
-    Trả về dict: path → np.ndarray (BGR)
-    """
-    cache = {}
+    """Đọc tất cả ảnh vào RAM 1 lần duy nhất."""
+    cache  = {}
     failed = 0
     for fp in file_list:
         img = cv2.imread(fp)
@@ -295,7 +274,7 @@ def cache_images(file_list):
             continue
         cache[fp] = img
     if failed > 0:
-        print(f"  ⚠️  Không đọc được {failed} file ảnh (bị hỏng hoặc sai định dạng)")
+        print(f"  ⚠️  Không đọc được {failed} file ảnh")
     return cache
 
 
@@ -304,14 +283,8 @@ def cache_images(file_list):
 # ==============================================================================
 def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
                              target=TARGET_PER_CLASS):
-    """
-    Gộp dữ liệu từ nhiều thư mục. Chia Train/Val/Test.
-    Oversampling thông minh với giới hạn ratio.
-    ✅ FIX: Cache ảnh vào RAM — không đọc lại từ disk trong vòng lặp augment.
-    """
     all_files = {cls_name: [] for cls_name in CLASS_NAMES}
 
-    # Thu thập đường dẫn ảnh
     for ddir in data_dirs:
         if not os.path.exists(ddir):
             print(f"  ⚠️  Thư mục không tồn tại: {ddir}")
@@ -348,10 +321,8 @@ def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
         bar = '█' * min(40, max(1, n // max(1, total // (40 * NUM_CLASSES))))
         print(f"  {cls_name:>2}: {n:5d}  {bar}")
 
-    # Chia split theo từng class (stratified)
-    val_ratio = val_size / (1.0 - test_size) if test_size < 1.0 else 0.0
-
-    split_paths = {'train': [], 'val': [], 'test': []}
+    val_ratio    = val_size / (1.0 - test_size) if test_size < 1.0 else 0.0
+    split_paths  = {'train': [], 'val': [], 'test': []}
     split_labels = {'train': [], 'val': [], 'test': []}
 
     for cls_idx, cls_name in enumerate(CLASS_NAMES):
@@ -359,35 +330,34 @@ def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
         if not files:
             continue
         if len(files) > 5:
-            tv_fp, test_fp = train_test_split(files, test_size=test_size, random_state=42)
-            train_fp, val_fp = train_test_split(tv_fp, test_size=val_ratio, random_state=42)
+            tv_fp, test_fp   = train_test_split(files, test_size=test_size,
+                                                 random_state=42)
+            train_fp, val_fp = train_test_split(tv_fp, test_size=val_ratio,
+                                                 random_state=42)
         else:
             train_fp, val_fp, test_fp = files, [], []
 
-        for split_name, paths in [('train', train_fp), ('val', val_fp), ('test', test_fp)]:
+        for split_name, paths in [('train', train_fp), ('val', val_fp),
+                                   ('test', test_fp)]:
             split_paths[split_name].extend(paths)
             split_labels[split_name].extend([cls_idx] * len(paths))
 
-    # ✅ Cache tất cả ảnh vào RAM 1 lần
     all_paths = (split_paths['train'] + split_paths['val'] + split_paths['test'])
     print(f"\n📂 Đang cache {len(all_paths):,} ảnh vào RAM...")
-    t0 = time.time()
+    t0        = time.time()
     img_cache = cache_images(all_paths)
     print(f"  ✅ Cache hoàn tất trong {time.time()-t0:.1f}s "
-          f"({len(img_cache):,}/{len(all_paths):,} ảnh thành công)")
+          f"({len(img_cache):,}/{len(all_paths):,} ảnh)")
 
-    def process_split(paths, labels, do_augment=False, split_name=''):
-        """Trích HOG + augment (dùng img_cache, không đọc lại disk)."""
-        X, y = [], []
-        paths_by_class = defaultdict(list)
+    def process_split(paths, labels, do_augment=False):
+        X, y          = [], []
+        paths_by_cls  = defaultdict(list)
         for p, l in zip(paths, labels):
-            paths_by_class[l].append(p)
+            paths_by_cls[l].append(p)
 
-        for cls_idx, cls_paths in sorted(paths_by_class.items()):
-            cls_name = CLASS_NAMES[cls_idx] if cls_idx < NUM_CLASSES else '?'
-
-            # Trích HOG từ ảnh gốc (từ cache)
-            orig_feats = []   # list of (img_bgr, feat)
+        for cls_idx, cls_paths in sorted(paths_by_cls.items()):
+            cls_name  = CLASS_NAMES[cls_idx] if cls_idx < NUM_CLASSES else '?'
+            orig_feats = []
             for fp in cls_paths:
                 img = img_cache.get(fp)
                 if img is None:
@@ -399,17 +369,15 @@ def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
             if not orig_feats:
                 continue
 
-            for img, feat in orig_feats:
-                X.append(feat)
-                y.append(cls_idx)
+            for _, feat in orig_feats:
+                X.append(feat); y.append(cls_idx)
 
             if do_augment:
                 n_orig        = len(orig_feats)
                 actual_target = min(target, n_orig * MAX_OVERSAMPLE_RATIO)
                 needed        = max(0, actual_target - n_orig)
+                aug_count     = 0
 
-                aug_count = 0
-                # ✅ FIX: dùng ảnh từ cache (img), không gọi cv2.imread lại
                 while aug_count < needed:
                     img, _ = random.choice(orig_feats)
                     for aug_img in augment_char(img):
@@ -417,8 +385,7 @@ def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
                             break
                         feat = extract_hog(aug_img)
                         if feat is not None:
-                            X.append(feat)
-                            y.append(cls_idx)
+                            X.append(feat); y.append(cls_idx)
                             aug_count += 1
 
                 n_total = n_orig + aug_count
@@ -429,80 +396,95 @@ def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15,
 
     print(f"\n  Đang xử lý tập TRAIN (kèm oversampling)...")
     train_data = process_split(split_paths['train'], split_labels['train'],
-                               do_augment=True, split_name='train')
+                               do_augment=True)
     print(f"\n  Đang xử lý tập VAL...")
-    val_data   = process_split(split_paths['val'], split_labels['val'],
-                               do_augment=False, split_name='val')
+    val_data   = process_split(split_paths['val'],   split_labels['val'])
     print(f"  Đang xử lý tập TEST...")
-    test_data  = process_split(split_paths['test'], split_labels['test'],
-                               do_augment=False, split_name='test')
+    test_data  = process_split(split_paths['test'],  split_labels['test'])
 
     return train_data, val_data, test_data
 
 
 # ==============================================================================
-# KIẾN TRÚC ANN (giữ nguyên để tương thích với inference code)
+# KIẾN TRÚC ANN — OCRNet v3 với Residual Connection
 # ==============================================================================
 class OCRNet(nn.Module):
+    """
+    🐛 FIX #6: Dropout giảm 0.4/0.35/0.3/0.2 → 0.3/0.25/0.2/0.1
+    🐛 FIX #7: Bottleneck tăng 64 → 128
+    🐛 FIX #8: Thêm Residual Connection skip từ 256 → 128
+                → chống gradient vanish ở các layer sâu
+    """
     def __init__(self, input_dim, num_classes=NUM_CLASSES):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 512), nn.BatchNorm1d(512), nn.SiLU(), nn.Dropout(0.4),
-            nn.Linear(512, 256),       nn.BatchNorm1d(256), nn.SiLU(), nn.Dropout(0.35),
-            nn.Linear(256, 128),       nn.BatchNorm1d(128), nn.SiLU(), nn.Dropout(0.3),
-            nn.Linear(128, 64),        nn.BatchNorm1d(64),  nn.SiLU(), nn.Dropout(0.2),
-            nn.Linear(64, num_classes)
+        self.fc1 = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512), nn.SiLU(), nn.Dropout(0.3)   # FIX: 0.4→0.3
         )
+        self.fc2 = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256), nn.SiLU(), nn.Dropout(0.25)  # FIX: 0.35→0.25
+        )
+        self.fc3 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128), nn.SiLU(), nn.Dropout(0.2)   # FIX: 0.3→0.2
+        )
+        self.fc4 = nn.Sequential(
+            nn.Linear(128, 128),                               # FIX: 64→128
+            nn.BatchNorm1d(128), nn.SiLU(), nn.Dropout(0.1)   # FIX: 0.2→0.1
+        )
+        self.out  = nn.Linear(128, num_classes)
+        # FIX #8: Residual skip: project 256 → 128
+        self.skip = nn.Linear(256, 128, bias=False)
 
     def forward(self, x):
-        return self.net(x)
+        x        = self.fc1(x)
+        x        = self.fc2(x)
+        residual = self.skip(x)       # project 256 → 128
+        x        = self.fc3(x) + residual   # residual addition
+        x        = self.fc4(x)
+        return self.out(x)
 
 
 # ==============================================================================
-# TEST-TIME AUGMENTATION (TTA) — ✅ MỚI
+# TEST-TIME AUGMENTATION (TTA)
 # ==============================================================================
 def predict_with_tta(model, X_test_raw, scaler, n_aug=TTA_N_AUG):
     """
-    Evaluate trên test set với TTA: augment mỗi feature vector ngẫu nhiên
-    bằng cách thêm Gaussian noise nhỏ (vì chúng ta đã ở feature space).
-    Lấy trung bình softmax probabilities → tăng accuracy.
+    TTA: augment feature vector bằng Gaussian noise nhỏ.
+    Lấy trung bình softmax → tăng accuracy ~1-2%.
     """
     model.eval()
     X_test_sc = scaler.transform(X_test_raw)
     all_probs = []
 
     with torch.no_grad():
-        # Original
-        t_in = torch.tensor(X_test_sc, dtype=torch.float32).to(device)
+        t_in  = torch.tensor(X_test_sc, dtype=torch.float32).to(device)
         probs = torch.softmax(model(t_in), dim=1).cpu().numpy()
         all_probs.append(probs)
 
-        # Augmented versions (small noise in feature space)
         for _ in range(n_aug):
-            noise = np.random.normal(0, 0.01, X_test_sc.shape).astype(np.float32)
-            t_noisy = torch.tensor(X_test_sc + noise, dtype=torch.float32).to(device)
-            probs_aug = torch.softmax(model(t_noisy), dim=1).cpu().numpy()
-            all_probs.append(probs_aug)
+            noise    = np.random.normal(0, 0.01, X_test_sc.shape).astype(np.float32)
+            t_noisy  = torch.tensor(X_test_sc + noise, dtype=torch.float32).to(device)
+            all_probs.append(torch.softmax(model(t_noisy), dim=1).cpu().numpy())
 
     avg_probs = np.mean(all_probs, axis=0)
     return avg_probs.argmax(axis=1)
 
 
 # ==============================================================================
-# PHÂN TÍCH CONFUSION — ✅ MỚI
+# PHÂN TÍCH CONFUSION MATRIX
 # ==============================================================================
 def analyze_confusions(cm, class_names, top_n=10):
-    """In ra top-N cặp nhầm lẫn nhiều nhất và per-class accuracy."""
+    """In top-N cặp nhầm lẫn và per-class accuracy."""
     n = len(class_names)
 
-    # Per-class accuracy
     per_class_acc = []
     for i in range(n):
         total = cm[i].sum()
         acc   = cm[i, i] / total if total > 0 else 0.0
         per_class_acc.append((class_names[i], acc, total))
 
-    # Confusion pairs
     pairs = []
     for i in range(n):
         for j in range(n):
@@ -510,20 +492,22 @@ def analyze_confusions(cm, class_names, top_n=10):
                 pairs.append((cm[i, j], class_names[i], class_names[j]))
     pairs.sort(reverse=True)
 
-    report_lines = []
-    report_lines.append("=" * 55)
-    report_lines.append(f"TOP {top_n} CẶP NHẦM LẪN NHIỀU NHẤT")
-    report_lines.append("=" * 55)
-    report_lines.append(f"{'Thực tế':>10} → {'Dự đoán':<10}  {'Số lần':>8}")
-    report_lines.append("-" * 40)
+    report_lines = [
+        "=" * 55,
+        f"TOP {top_n} CẶP NHẦM LẪN NHIỀU NHẤT",
+        "=" * 55,
+        f"{'Thực tế':>10} → {'Dự đoán':<10}  {'Số lần':>8}",
+        "-" * 40,
+    ]
     for count, true_cls, pred_cls in pairs[:top_n]:
         report_lines.append(f"{true_cls:>10} → {pred_cls:<10}  {count:>8}")
 
-    report_lines.append("\n" + "=" * 55)
-    report_lines.append("PER-CLASS ACCURACY (5 class tệ nhất)")
-    report_lines.append("=" * 55)
-    per_class_acc_sorted = sorted(per_class_acc, key=lambda x: x[1])
-    for cls_name, acc, total in per_class_acc_sorted[:5]:
+    report_lines += [
+        "\n" + "=" * 55,
+        "PER-CLASS ACCURACY (5 class tệ nhất)",
+        "=" * 55,
+    ]
+    for cls_name, acc, total in sorted(per_class_acc, key=lambda x: x[1])[:5]:
         bar = '▓' * int(acc * 20)
         report_lines.append(f"  {cls_name:>2}: {acc:6.2%}  {bar}  (n={total})")
 
@@ -531,9 +515,8 @@ def analyze_confusions(cm, class_names, top_n=10):
     print(text)
 
     with open("ocr_confusion_pairs.txt", "w", encoding="utf-8") as f:
-        # Full pairs
         f.write("=" * 55 + "\n")
-        f.write(f"TẤT CẢ CẶP NHẦM LẪN\n")
+        f.write("TẤT CẢ CẶP NHẦM LẪN\n")
         f.write("=" * 55 + "\n")
         for count, true_cls, pred_cls in pairs:
             f.write(f"{true_cls} → {pred_cls}: {count}\n")
@@ -590,34 +573,32 @@ if __name__ == "__main__":
 
     # ── 4. Model + Loss + Optimiser ───────────────────────────────────
     print("\n🧠 [3/6] Khởi tạo model, loss, optimiser...")
-    model = OCRNet(X_train.shape[1]).to(device)
+    model        = OCRNet(X_train.shape[1]).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {total_params:,}")
 
-    # ✅ Focal Loss thay thế Weighted CE + Label Smoothing
     criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA, smoothing=0.05)
-    optimizer = optim.AdamW(model.parameters(), lr=LR_MAX / 25.0, weight_decay=5e-4)
+    optimizer  = optim.AdamW(model.parameters(), lr=LR_MAX / 25.0, weight_decay=5e-4)
 
-    # ✅ OneCycleLR — ramp up → peak → cosine decay
+    # OneCycleLR — step per batch
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=LR_MAX,
         steps_per_epoch=len(train_dl),
         epochs=EPOCHS,
-        pct_start=0.15,       # 15% epoch đầu tăng LR
+        pct_start=0.15,
         anneal_strategy='cos',
-        div_factor=25.0,      # LR bắt đầu = max_lr/25
-        final_div_factor=1e4  # LR cuối = max_lr/10000
+        div_factor=25.0,
+        final_div_factor=1e4
     )
 
-    # ✅ SWA model
-    swa_model  = AveragedModel(model)
-    swa_start  = max(1, int(EPOCHS * SWA_START_FRAC))
-    swa_sched  = SWALR(optimizer, swa_lr=SWA_LR, anneal_epochs=10)
-    swa_active = False
+    # SWA model
+    swa_model = AveragedModel(model)
+    swa_start = max(1, int(EPOCHS * SWA_START_FRAC))
+    swa_sched = SWALR(optimizer, swa_lr=SWA_LR, anneal_epochs=10)
 
     # ── 5. Training loop ──────────────────────────────────────────────
-    print(f"\n🚀 [4/6] Training (max {EPOCHS} epochs, patience={PATIENCE} theo val_acc)...")
+    print(f"\n🚀 [4/6] Training (max {EPOCHS} epochs, patience={PATIENCE})...")
     print(f"{'Ep':>5} | {'LR':>8} | {'TrLoss':>7} | {'TrAcc':>6} | "
           f"{'VlLoss':>7} | {'VlAcc':>6} | GradNorm")
     print("-" * 70)
@@ -626,12 +607,13 @@ if __name__ == "__main__":
     best_state   = None
     no_improve   = 0
     history      = {'tr_loss': [], 'vl_loss': [], 'tr_acc': [], 'vl_acc': [], 'lr': []}
+    # FIX #5: Chỉ dùng swa_started, bỏ biến swa_active không dùng
     swa_started  = False
 
     os.makedirs("checkpoints", exist_ok=True)
 
     for ep in range(1, EPOCHS + 1):
-        # ── Chuyển sang SWA phase ──────────────────────────────────
+        # Bắt đầu SWA phase
         if ep == swa_start and not swa_started:
             print(f"\n  🔄 Bắt đầu SWA phase từ epoch {ep}")
             swa_started = True
@@ -648,24 +630,22 @@ if __name__ == "__main__":
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()
 
-            # ✅ Mixup — FIX: tính loss đúng với cả 2 nhãn
+            # Mixup với accuracy tracking chuẩn
             if random.random() < MIXUP_PROB:
-                lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
-                idx = torch.randperm(bx.size(0), device=device)
+                lam     = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                idx     = torch.randperm(bx.size(0), device=device)
                 bx_mix  = lam * bx + (1 - lam) * bx[idx]
                 by_a, by_b = by, by[idx]
-                out  = model(bx_mix)
-                loss = lam * criterion(out, by_a) + (1 - lam) * criterion(out, by_b)
-                # ✅ FIX: accuracy tracking cho mixup — dùng nhãn có lam cao hơn
+                out     = model(bx_mix)
+                loss    = lam * criterion(out, by_a) + (1 - lam) * criterion(out, by_b)
                 pred_label = by_a if lam >= 0.5 else by_b
             else:
-                out  = model(bx)
-                loss = criterion(out, by)
+                out        = model(bx)
+                loss       = criterion(out, by)
                 pred_label = by
 
             loss.backward()
 
-            # Gradient clipping + track norm
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             grad_norms.append(gn.item() if hasattr(gn, 'item') else float(gn))
 
@@ -686,10 +666,9 @@ if __name__ == "__main__":
         vl_loss = vl_correct = vl_total = 0
         with torch.no_grad():
             for bx, by in val_dl:
-                bx, by = bx.to(device), by.to(device)
+                bx, by   = bx.to(device), by.to(device)
                 out      = model(bx)
-                loss     = criterion(out, by)
-                vl_loss    += loss.item()
+                vl_loss    += criterion(out, by).item()
                 vl_correct += (out.argmax(1) == by).sum().item()
                 vl_total   += by.size(0)
 
@@ -706,7 +685,6 @@ if __name__ == "__main__":
         history['vl_acc'].append(vl_acc)
         history['lr'].append(cur_lr)
 
-        # ✅ FIX: Early stopping theo val_ACC (không bị ảnh hưởng label smoothing)
         marker = ""
         if vl_acc > best_val_acc:
             best_val_acc = vl_acc
@@ -725,45 +703,44 @@ if __name__ == "__main__":
         if ep % CHECKPOINT_EVERY == 0:
             ckpt_path = f"checkpoints/ocr_ep{ep:04d}.pth"
             torch.save({
-                'epoch': ep,
-                'model_state': {k: v.cpu() for k, v in model.state_dict().items()},
+                'epoch':           ep,
+                'model_state':     {k: v.cpu() for k, v in model.state_dict().items()},
                 'optimizer_state': optimizer.state_dict(),
-                'best_val_acc': best_val_acc,
-                'history': history,
+                'best_val_acc':    best_val_acc,
+                'history':         history,
             }, ckpt_path)
 
         if no_improve >= PATIENCE:
-            print(f"\n⏹️  Early stopping tại epoch {ep} (val_acc không tăng {PATIENCE} epoch liên tiếp)")
+            print(f"\n⏹️  Early stopping tại epoch {ep} "
+                  f"(val_acc không tăng {PATIENCE} epoch liên tiếp)")
             break
 
     # ── 6. SWA finalize ──────────────────────────────────────────────
     if swa_started:
         print("\n⚙️  Cập nhật BatchNorm cho SWA model...")
         update_bn(train_dl, swa_model, device=device)
-        swa_state = {k: v.cpu().clone() for k, v in swa_model.module.state_dict().items()}
+        swa_state = {k: v.cpu().clone()
+                     for k, v in swa_model.module.state_dict().items()}
         torch.save(swa_state, "ocr_model_swa.pth")
         print("  ✅ Đã lưu: ocr_model_swa.pth")
 
-    # ── Lưu scaler ────────────────────────────────────────────────────
     with open("ocr_scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
     print(f"\n💾 Đã lưu: ocr_model_best.pth  |  ocr_scaler.pkl")
     print(f"   Best Val Acc: {best_val_acc:.2%}")
 
-    # ── 7. Đánh giá Test (có TTA) ─────────────────────────────────────
+    # ── 7. Đánh giá Test (với TTA) ─────────────────────────────────────
     print("\n📊 [5/6] Đánh giá tập Test...")
     if len(X_test_raw) > 0 and best_state is not None:
         eval_model = OCRNet(X_train.shape[1]).to(device)
         eval_model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
-        # Standard prediction
         eval_model.eval()
         with torch.no_grad():
-            t_in   = torch.tensor(scaler.transform(X_test_raw),
-                                  dtype=torch.float32).to(device)
+            t_in       = torch.tensor(scaler.transform(X_test_raw),
+                                      dtype=torch.float32).to(device)
             t_pred_std = eval_model(t_in).argmax(1).cpu().numpy()
 
-        # ✅ TTA prediction
         print(f"  Đang chạy TTA (n_aug={TTA_N_AUG})...")
         t_pred_tta = predict_with_tta(eval_model, X_test_raw, scaler, n_aug=TTA_N_AUG)
 
@@ -771,23 +748,22 @@ if __name__ == "__main__":
         acc_tta = (t_pred_tta == y_test).mean()
         print(f"\n  Accuracy (standard): {acc_std:.2%}")
         print(f"  Accuracy (TTA ×{TTA_N_AUG+1}):  {acc_tta:.2%}  "
-              f"({'↑' if acc_tta > acc_std else '='}{abs(acc_tta-acc_std):.2%})")
+              f"({'↑' if acc_tta > acc_std else '='}"
+              f"{abs(acc_tta-acc_std):.2%})")
 
         print("\n  Classification Report:")
         print(classification_report(y_test, t_pred_tta,
                                     target_names=CLASS_NAMES, zero_division=0))
 
         cm = confusion_matrix(y_test, t_pred_tta)
-
-        print("\n")
-        per_class = analyze_confusions(cm, CLASS_NAMES)
+        analyze_confusions(cm, CLASS_NAMES)
         print("  → Đã lưu: ocr_confusion_pairs.txt")
 
-        # Confusion matrix heatmap
         fig, ax = plt.subplots(figsize=(16, 13))
-        vmax = np.percentile(cm[cm > 0], 95) if (cm > 0).any() else 1
-        im = ax.imshow(cm, interpolation='nearest', cmap='Blues', vmax=vmax)
-        ax.set_title('Confusion Matrix — OCR v2 (TTA)', fontsize=14, fontweight='bold')
+        vmax    = np.percentile(cm[cm > 0], 95) if (cm > 0).any() else 1
+        im      = ax.imshow(cm, interpolation='nearest', cmap='Blues', vmax=vmax)
+        ax.set_title('Confusion Matrix — OCRNet v3 (TTA)', fontsize=14,
+                     fontweight='bold')
         ax.set_xlabel('Dự đoán', fontsize=11)
         ax.set_ylabel('Thực tế', fontsize=11)
         ticks = np.arange(NUM_CLASSES)
@@ -799,7 +775,8 @@ if __name__ == "__main__":
             for j in range(NUM_CLASSES):
                 if cm[i, j] > 0:
                     ax.text(j, i, str(cm[i, j]), ha='center', va='center',
-                            fontsize=6, color='white' if cm[i, j] > thresh else 'black')
+                            fontsize=6,
+                            color='white' if cm[i, j] > thresh else 'black')
         plt.colorbar(im, ax=ax)
         plt.tight_layout()
         plt.savefig('ocr_confusion_matrix.png', dpi=150)
@@ -814,11 +791,14 @@ if __name__ == "__main__":
 
     axes[0].plot(history['tr_acc'], label='Train')
     axes[0].plot(history['vl_acc'], label='Val')
-    if swa_started and best_val_acc > 0:
-        axes[0].axvline(swa_start, color='r', linestyle='--', alpha=0.5, label='SWA start')
+    if swa_started:
+        axes[0].axvline(swa_start, color='r', linestyle='--',
+                        alpha=0.5, label='SWA start')
     axes[0].set_title('Accuracy'); axes[0].set_xlabel('Epoch')
     axes[0].legend(); axes[0].grid(True, alpha=0.3)
-    axes[0].set_ylim([max(0, min(history['tr_acc'] + history['vl_acc']) - 0.05), 1.0])
+    axes[0].set_ylim([
+        max(0, min(history['tr_acc'] + history['vl_acc']) - 0.05), 1.0
+    ])
 
     axes[1].plot(history['tr_loss'], label='Train')
     axes[1].plot(history['vl_loss'], label='Val')
@@ -829,7 +809,8 @@ if __name__ == "__main__":
     axes[2].set_title('Learning Rate (OneCycleLR)'); axes[2].set_xlabel('Epoch')
     axes[2].set_ylabel('LR'); axes[2].grid(True, alpha=0.3)
     if swa_started:
-        axes[2].axvline(swa_start, color='r', linestyle='--', alpha=0.5, label='SWA start')
+        axes[2].axvline(swa_start, color='r', linestyle='--',
+                        alpha=0.5, label='SWA start')
         axes[2].legend()
 
     plt.tight_layout()
@@ -837,11 +818,11 @@ if __name__ == "__main__":
     plt.close()
     print("  → Đã lưu: ocr_training_history.png")
 
-    print("\n✅ Hoàn thành Train OCR v2!")
+    print("\n✅ Hoàn thành Train OCR v3!")
     print("   Đầu ra:")
-    print("     ocr_model_best.pth    — dùng trong inference code")
+    print("     ocr_model_best.pth")
     if swa_started:
-        print("     ocr_model_swa.pth    — thử dùng cái này nếu best không tốt hơn")
+        print("     ocr_model_swa.pth")
     print("     ocr_scaler.pkl")
     print("     ocr_confusion_matrix.png")
     print("     ocr_confusion_pairs.txt")

@@ -3,7 +3,7 @@ opencv-python
 matplotlib
 pillow
 scikit-learn
-tensorflow        
+tensorflow
 keras
-flask            
+flask
 jupyter
