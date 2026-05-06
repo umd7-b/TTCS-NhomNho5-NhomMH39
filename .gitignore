@@ -1,0 +1,20 @@
+dataset/
+dataset2/
+__pycache__/
+chars/
+venv/
+.vscode/
+app.py
+
+# Models & Weights
+*.pth
+*.pkl
+*.npy
+
+# Logs / Images
+*.png
+
+# Dataset & Checkpoints
+dataset_ocr/
+dataset_plate/
+checkpoints/

@@ -1,0 +1,6 @@
+path: c:/Users/TUAN/Downloads/TTCS/dataset1
+train: images/train
+val: images/val
+
+names:
+  0: license_plate

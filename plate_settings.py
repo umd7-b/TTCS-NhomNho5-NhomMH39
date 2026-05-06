@@ -1,0 +1,9 @@
+IMG_SIZE_RECT = (80, 64)
+IMG_SIZE_SQ = (80, 64)
+MAX_HOG_LEN = 2268
+ASPECT_RATIO_THRESHOLD = 1.6
+IMG_SIZE_OCR = 64
+CLASS_NAMES = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'K', 'L', 'M', 'N', 'P', 'S', 'T', 'U', 'V', 'X', 'Y', 'Z']
+NUM_CLASSES = len(CLASS_NAMES)
+MAX_DETECTIONS = 5
+MAX_IMAGE_SIDE_FOR_SEARCH = 640
