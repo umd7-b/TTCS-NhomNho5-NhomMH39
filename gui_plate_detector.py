@@ -1,3 +1,4 @@
+import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
@@ -154,14 +155,6 @@ def _prepare_candidate_boxes(img_bgr):
         aspect = bw / float(max(1, bh))
         if aspect < 0.5 or aspect > 6.5:
             continue
-        qx, qy = (x // 4, y // 4)
-        qw, qh = (bw // 4, bh // 4)
-        key = (qx, qy, qw, qh)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append((x, y, bw, bh))
-    for x, y, bw, bh in _generate_contour_proposals(img_bgr):
         qx, qy = (x // 4, y // 4)
         qw, qh = (bw // 4, bh // 4)
         key = (qx, qy, qw, qh)
@@ -615,38 +608,179 @@ def _format_plate(raw):
 
 class PlateDetectorGUI:
 
+    # ── Design tokens (Light, soft, harmonious) ──
+    C_BG         = '#f5f6fa'      # warm light gray background
+    C_SURFACE    = '#ffffff'      # white cards
+    C_ELEVATED   = '#ffffff'      # header
+    C_BORDER     = '#e4e7f0'      # soft border
+    C_ACCENT     = '#6366f1'      # indigo accent
+    C_ACCENT_H   = '#818cf8'      # lighter indigo hover
+    C_ACCENT_BG  = '#eef2ff'      # very faint indigo background
+    C_TEXT       = '#1e293b'      # dark slate text
+    C_TEXT2      = '#94a3b8'      # muted text
+    C_SUCCESS    = '#10b981'      # emerald green
+    C_SUCCESS_BG = '#ecfdf5'      # faint green bg
+    C_WARN       = '#f59e0b'      # warm amber
+    C_DANGER     = '#ef4444'      # soft red
+    C_DANGER_H   = '#fca5a5'      # light red hover
+    C_CANVAS_BG  = '#f0f1f6'      # canvas background
+
     def __init__(self, root, model, scaler, ocr_model=None, ocr_scaler=None):
         self.root = root
         self.model = model
         self.scaler = scaler
         self.ocr_model = ocr_model
         self.ocr_scaler = ocr_scaler
-        self.root.title('Trình Nhận Diện & Đọc Biển Số Xe VN (HOG + ANN)')
-        self.root.geometry('1000x750')
-        self.root.configure(bg='#f0f0f0')
+
+        # ── Theme & Window ──
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+        self.root.title('Nhận diện biển số xe')
+        self.root.geometry('1200x880')
+        self.root.minsize(980, 720)
+        self.root.configure(fg_color=self.C_BG)
+
         self.img_original = None
         self.img_tk = None
         self.scale_factor = 1.0
         self.rect_id = None
         self.start_x = None
         self.start_y = None
-        top_frame = tk.Frame(self.root, pady=8, bg='#f0f0f0')
-        top_frame.pack(side=tk.TOP, fill=tk.X, padx=10)
-        self.btn_load = tk.Button(top_frame, text='📁 Tải Ảnh', command=self.load_image, bg='#e0e0e0', font=('Arial', 10, 'bold'), padx=10)
-        self.btn_load.pack(side=tk.LEFT, padx=5)
-        self.btn_auto = tk.Button(top_frame, text=' Nhận diện Tự động', command=self.auto_detect, bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'), padx=10)
-        self.btn_auto.pack(side=tk.LEFT, padx=5)
-        self.btn_clear = tk.Button(top_frame, text='Xoá Detect', command=self.clear_detections, bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=10)
-        self.btn_clear.pack(side=tk.LEFT, padx=5)
-        self.lbl_status = tk.Label(top_frame, text='Vui lòng tải ảnh để bắt đầu. Ngưỡng mặc định: 85%', font=('Helvetica', 11), fg='blue', bg='#f0f0f0')
-        self.lbl_status.pack(side=tk.LEFT, padx=20)
         self.fixed_confidence_threshold = 0.85
-        self.lbl_result = tk.Label(self.root, text='Biển số: —', font=('Segoe UI', 24, 'bold'), fg='#ffffff', bg='#1a237e', pady=10)
-        self.lbl_result.pack(side=tk.BOTTOM, fill=tk.X)
-        lbl_instructions = tk.Label(self.root, text="Bấm '🔍 Nhận diện Tự động' để quét, hoặc kéo chuột để khoanh vùng thủ công.", justify=tk.LEFT, bg='#f0f0f0', font=('Arial', 9))
-        lbl_instructions.pack(side=tk.BOTTOM, pady=3)
-        self.canvas = tk.Canvas(self.root, cursor='cross', bg='#DDDDDD')
-        self.canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # ═══════════════════════════════════════════
+        # HEADER
+        # ═══════════════════════════════════════════
+        header = ctk.CTkFrame(self.root, fg_color=self.C_SURFACE, corner_radius=0, height=64,
+                              border_width=0)
+        header.pack(side=tk.TOP, fill=tk.X)
+        header.pack_propagate(False)
+
+        # Soft accent gradient line at top
+        accent_line = ctk.CTkFrame(header, fg_color=self.C_ACCENT, height=3, corner_radius=0)
+        accent_line.pack(side=tk.TOP, fill=tk.X)
+
+        header_inner = ctk.CTkFrame(header, fg_color='transparent')
+        header_inner.pack(fill=tk.BOTH, expand=True, padx=28)
+
+        # App icon circle
+        ctk.CTkLabel(header_inner, text='  VP  ',
+                     font=ctk.CTkFont(size=13, weight='bold'),
+                     text_color='#ffffff',
+                     fg_color=self.C_ACCENT, corner_radius=10
+                     ).pack(side=tk.LEFT, padx=(0, 14), pady=14)
+
+        ctk.CTkLabel(header_inner, text='Nhận diện biển số xe',
+                     font=ctk.CTkFont(family='Segoe UI', size=20, weight='bold'),
+                     text_color=self.C_TEXT).pack(side=tk.LEFT, pady=14)
+
+        ctk.CTkLabel(header_inner, text='HOG + ANN  ·  OCR',
+                     font=ctk.CTkFont(size=11),
+                     text_color=self.C_TEXT2).pack(side=tk.LEFT, padx=14, pady=14)
+
+        # Device badge
+        device_text = 'CUDA' if 'cuda' in str(device) else 'CPU'
+        badge_fg = self.C_SUCCESS if 'cuda' in str(device) else self.C_WARN
+        badge_bg = self.C_SUCCESS_BG if 'cuda' in str(device) else '#fffbeb'
+        ctk.CTkLabel(header_inner, text=f'  {device_text}  ',
+                     font=ctk.CTkFont(size=10, weight='bold'),
+                     text_color=badge_fg,
+                     fg_color=badge_bg, corner_radius=8
+                     ).pack(side=tk.RIGHT, padx=4, pady=14)
+
+        # Header bottom border
+        ctk.CTkFrame(self.root, fg_color=self.C_BORDER, height=1, corner_radius=0
+                     ).pack(side=tk.TOP, fill=tk.X)
+
+        # ═══════════════════════════════════════════
+        # TOOLBAR
+        # ═══════════════════════════════════════════
+        toolbar_card = ctk.CTkFrame(self.root, fg_color=self.C_SURFACE,
+                                    corner_radius=16, border_width=1,
+                                    border_color=self.C_BORDER)
+        toolbar_card.pack(side=tk.TOP, fill=tk.X, padx=24, pady=(16, 0))
+
+        toolbar_inner = ctk.CTkFrame(toolbar_card, fg_color='transparent')
+        toolbar_inner.pack(fill=tk.X, padx=18, pady=14)
+
+        btn_font = ctk.CTkFont(family='Segoe UI', size=13, weight='bold')
+
+        self.btn_load = ctk.CTkButton(
+            toolbar_inner, text='Tải Ảnh', command=self.load_image,
+            width=130, height=42,
+            fg_color=self.C_BG, hover_color=self.C_BORDER,
+            border_color=self.C_BORDER, border_width=1,
+            font=btn_font, corner_radius=22, text_color=self.C_TEXT)
+        self.btn_load.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_auto = ctk.CTkButton(
+            toolbar_inner, text='Nhận Diện Tự Động', command=self.auto_detect,
+            width=200, height=42,
+            fg_color=self.C_ACCENT, hover_color=self.C_ACCENT_H,
+            font=btn_font, corner_radius=22, text_color='#ffffff')
+        self.btn_auto.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_clear = ctk.CTkButton(
+            toolbar_inner, text='Xoá', command=self.clear_detections,
+            width=90, height=42,
+            fg_color='#fef2f2', hover_color=self.C_DANGER_H,
+            border_color='#fecaca', border_width=1,
+            font=btn_font, corner_radius=22, text_color=self.C_DANGER)
+        self.btn_clear.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Separator dot
+        ctk.CTkLabel(toolbar_inner, text='·',
+                     font=ctk.CTkFont(size=20), text_color=self.C_BORDER
+                     ).pack(side=tk.LEFT, padx=(0, 12))
+
+        self.lbl_status = ctk.CTkLabel(
+            toolbar_inner, text='Tải ảnh để bắt đầu  ·  Ngưỡng 85%',
+            font=ctk.CTkFont(family='Segoe UI', size=12), text_color=self.C_TEXT2)
+        self.lbl_status.pack(side=tk.LEFT, padx=4)
+
+        # ═══════════════════════════════════════════
+        # RESULT BANNER
+        # ═══════════════════════════════════════════
+        self.result_frame = ctk.CTkFrame(
+            self.root, fg_color=self.C_SURFACE, corner_radius=16,
+            height=76, border_width=1, border_color=self.C_BORDER)
+        self.result_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=24, pady=(0, 20))
+        self.result_frame.pack_propagate(False)
+
+        result_inner = ctk.CTkFrame(self.result_frame, fg_color='transparent')
+        result_inner.pack(fill=tk.BOTH, expand=True, padx=22, pady=10)
+
+        self.lbl_result_tag = ctk.CTkLabel(
+            result_inner, text='  BIỂN SỐ  ',
+            font=ctk.CTkFont(size=10, weight='bold'),
+            text_color=self.C_ACCENT, fg_color=self.C_ACCENT_BG, corner_radius=8)
+        self.lbl_result_tag.pack(side=tk.LEFT, padx=(0, 18))
+
+        self.lbl_result = ctk.CTkLabel(
+            result_inner, text='- - -',
+            font=ctk.CTkFont(family='Consolas', size=32, weight='bold'),
+            text_color=self.C_ACCENT)
+        self.lbl_result.pack(side=tk.LEFT, padx=4)
+
+        # ═══════════════════════════════════════════
+        # HINT
+        # ═══════════════════════════════════════════
+        ctk.CTkLabel(self.root,
+                     text='Nhận Diện Tự Động để quét toàn bộ, hoặc kéo chuột khoanh vùng thủ công',
+                     font=ctk.CTkFont(size=11), text_color=self.C_TEXT2
+                     ).pack(side=tk.BOTTOM, pady=(0, 6))
+
+        # ═══════════════════════════════════════════
+        # CANVAS
+        # ═══════════════════════════════════════════
+        canvas_card = ctk.CTkFrame(self.root, fg_color=self.C_SURFACE,
+                                   corner_radius=16, border_width=1,
+                                   border_color=self.C_BORDER)
+        canvas_card.pack(fill=tk.BOTH, expand=True, padx=24, pady=(12, 8))
+
+        self.canvas = tk.Canvas(canvas_card, cursor='cross', bg=self.C_CANVAS_BG,
+                                highlightthickness=1, highlightbackground=self.C_BORDER)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.canvas.bind('<ButtonPress-1>', self.on_button_press)
         self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_button_release)
@@ -669,8 +803,9 @@ class PlateDetectorGUI:
             self.img_tk = ImageTk.PhotoImage(image=Image.fromarray(img_rgb))
             self.canvas.delete('all')
             self.canvas.create_image(canvas_w / 2, canvas_h / 2, anchor=tk.CENTER, image=self.img_tk)
-            self.lbl_status.config(text='Ảnh đã tải. Sẵn sàng!', fg='black')
-            self.lbl_result.config(text='Biển số: —')
+            self.lbl_status.configure(text='Ảnh đã tải. Sẵn sàng!', text_color=self.C_ACCENT)
+            self.lbl_result.configure(text='- - -')
+            self.result_frame.configure(border_color=self.C_BORDER)
             self.rect_id = None
         except Exception as e:
             messagebox.showerror('Lỗi Tải Ảnh', f'Đã xảy ra lỗi: {e}')
@@ -680,8 +815,9 @@ class PlateDetectorGUI:
             messagebox.showwarning('Nhắc nhở', 'Bạn chưa tải ảnh kìa!')
             return
         threshold = self.fixed_confidence_threshold
-        self.lbl_status.config(text=f'Đang phân tích (ngưỡng {threshold * 100:.0f}% cố định)...', fg='orange')
-        self.lbl_result.config(text='Biển số: …')
+        self.lbl_status.configure(text=f'Đang phân tích (ngưỡng {threshold * 100:.0f}%)...', text_color=self.C_WARN)
+        self.lbl_result.configure(text='...')
+        self.result_frame.configure(border_color=self.C_BORDER)
         self.root.update()
         self.canvas.delete('auto_box')
         self.canvas.delete('auto_char_box')
@@ -694,8 +830,8 @@ class PlateDetectorGUI:
             search_img = self.img_original
         proposal_wh = _prepare_candidate_boxes(search_img)
         if len(proposal_wh) == 0:
-            self.lbl_status.config(text='Không tạo được candidate box từ ảnh.', fg='red')
-            self.lbl_result.config(text='Biển số: —')
+            self.lbl_status.configure(text='Không tạo được candidate box từ ảnh.', text_color=self.C_DANGER)
+            self.lbl_result.configure(text='- - -')
             return
         if search_scale < 1.0:
             inv_scale = 1.0 / search_scale
@@ -714,8 +850,8 @@ class PlateDetectorGUI:
             if is_plate_candidate(roi):
                 filtered_xyxy.append([x1, y1, x2, y2])
         if not filtered_xyxy:
-            self.lbl_status.config(text='Không còn candidate hợp lệ sau bước lọc.', fg='red')
-            self.lbl_result.config(text='Biển số: —')
+            self.lbl_status.configure(text='Không còn candidate hợp lệ sau bước lọc.', text_color=self.C_DANGER)
+            self.lbl_result.configure(text='- - -')
             return
         model_boxes, model_scores = _batch_predict_boxes(self.model, self.scaler, self.img_original, filtered_xyxy)
         detected_boxes = []
@@ -747,8 +883,8 @@ class PlateDetectorGUI:
             final_boxes = final_boxes[sorted_indices]
             final_scores = final_scores[sorted_indices]
         if len(final_boxes) == 0:
-            self.lbl_status.config(text=f'Không tìm thấy biển số nào (ngưỡng {threshold * 100:.0f}%).', fg='red')
-            self.lbl_result.config(text='Biển số: —')
+            self.lbl_status.configure(text=f'Không tìm thấy biển số nào (ngưỡng {threshold * 100:.0f}%).', text_color=self.C_DANGER)
+            self.lbl_result.configure(text='- - -')
             return
         canvas_w, canvas_h = (self.canvas.winfo_width(), self.canvas.winfo_height())
         img_start_x = (canvas_w - self.img_tk.width()) / 2
@@ -781,17 +917,17 @@ class PlateDetectorGUI:
             elif score >= 0.97 and has_text:
                 verified_results.append((x1, y1, x2, y2, score, plate_text, char_confs, char_bboxes, px1, py1))
         if len(verified_results) == 0:
-            self.lbl_status.config(text=f'Không tìm thấy biển số hợp lệ nào.', fg='red')
-            self.lbl_result.config(text='Đã đọc: —')
+            self.lbl_status.configure(text='Không tìm thấy biển số hợp lệ nào.', text_color=self.C_DANGER)
+            self.lbl_result.configure(text='- - -')
             return
         for x1, y1, x2, y2, score, plate_text, char_confs, char_bboxes, px1, py1 in verified_results:
             has_text = len(plate_text.replace('?', '').replace('-', '').replace(' ', '').replace('.', '')) >= 4
             if score >= 0.98:
-                color = '#00CC00'
+                color = self.C_ACCENT
             elif score >= 0.95:
-                color = '#66CC00'
+                color = self.C_SUCCESS
             else:
-                color = '#FFAA00'
+                color = self.C_WARN
             c_x1 = x1 * self.scale_factor + img_start_x
             c_y1 = y1 * self.scale_factor + img_start_y
             c_x2 = x2 * self.scale_factor + img_start_x
@@ -824,11 +960,12 @@ class PlateDetectorGUI:
             self.canvas.tag_lower(bg_id, t_id)
         if all_plate_texts:
             res_str = ' | '.join(all_plate_texts)
-            self.lbl_status.config(text=f'Tìm được {len(verified_results)} biển số', fg='green')
-            self.lbl_result.config(text=f'Đã đọc: {res_str}')
+            self.lbl_status.configure(text=f'Tìm được {len(verified_results)} biển số', text_color=self.C_SUCCESS)
+            self.lbl_result.configure(text=res_str)
+            self.result_frame.configure(border_color=self.C_ACCENT)
         else:
-            self.lbl_status.config(text=f'Tìm được {len(verified_results)} biển số', fg='green')
-            self.lbl_result.config(text='Đã đọc: —')
+            self.lbl_status.configure(text=f'Tìm được {len(verified_results)} biển số', text_color=self.C_SUCCESS)
+            self.lbl_result.configure(text='- - -')
 
     def clear_detections(self):
         if self.img_original is None:
@@ -839,8 +976,9 @@ class PlateDetectorGUI:
         if self.rect_id:
             self.canvas.delete(self.rect_id)
             self.rect_id = None
-        self.lbl_status.config(text='Đã xoá các vùng nhận diện.', fg='black')
-        self.lbl_result.config(text='Biển số: —')
+        self.lbl_status.configure(text='Đã xoá các vùng nhận diện.', text_color=self.C_TEXT2)
+        self.lbl_result.configure(text='- - -')
+        self.result_frame.configure(border_color=self.C_BORDER)
 
     def on_button_press(self, event):
         if self.img_original is None:
@@ -872,7 +1010,7 @@ class PlateDetectorGUI:
         orig_x1, orig_y1 = (max(0, orig_x1), max(0, orig_y1))
         orig_x2, orig_y2 = (min(w, orig_x2), min(h, orig_y2))
         if orig_x2 - orig_x1 < 10 or orig_y2 - orig_y1 < 10:
-            self.lbl_status.config(text='Vùng chọn quá nhỏ!', fg='orange')
+            self.lbl_status.configure(text='Vùng chọn quá nhỏ!', text_color=self.C_WARN)
             self.canvas.delete(self.rect_id)
             self.rect_id = None
             return
@@ -882,8 +1020,9 @@ class PlateDetectorGUI:
         if prediction == 1:
             if plate_text:
                 avg_ocr = np.mean(char_confs) if char_confs else 0
-                self.lbl_status.config(text=f'BIỂN SỐ  det={confidence * 100:.1f}%  ocr={avg_ocr * 100:.1f}%', fg='green')
-                self.lbl_result.config(text=f'Biển số: {plate_text}')
+                self.lbl_status.configure(text=f'BIỂN SỐ  det={confidence * 100:.1f}%  ocr={avg_ocr * 100:.1f}%', text_color=self.C_SUCCESS)
+                self.lbl_result.configure(text=plate_text)
+                self.result_frame.configure(border_color=self.C_ACCENT)
                 if char_bboxes:
                     for cbx, cby, cbw, cbh in char_bboxes:
                         char_orig_x1 = orig_x1 + cbx
@@ -897,8 +1036,9 @@ class PlateDetectorGUI:
                         self.canvas.create_rectangle(char_canvas_x1, char_canvas_y1, char_canvas_x2, char_canvas_y2, outline='yellow', width=1, tags='manual_char_box')
                 label_text = f' {plate_text} '
             else:
-                self.lbl_status.config(text=f'DỰ ĐOÁN: BIỂN SỐ (Confidence: {confidence * 100:.1f}%) — chưa đọc được ký tự', fg='green')
-                self.lbl_result.config(text='Biển số: (?)')
+                self.lbl_status.configure(text=f'BIỂN SỐ (Confidence: {confidence * 100:.1f}%) - chưa đọc được ký tự', text_color=self.C_SUCCESS)
+                self.lbl_result.configure(text='(?)')
+                self.result_frame.configure(border_color=self.C_ACCENT)
                 label_text = ' Biển Số '
             self.canvas.itemconfig(self.rect_id, outline='green')
             c_x1, c_y1, _, _ = self.canvas.coords(self.rect_id)
@@ -911,8 +1051,9 @@ class PlateDetectorGUI:
             bg_id = self.canvas.create_rectangle(t_bbox, fill='green', outline='white', tags='manual_char_box')
             self.canvas.tag_lower(bg_id, t_id)
         else:
-            self.lbl_status.config(text=f'DỰ ĐOÁN: NỀN/RÁC (Confidence: {confidence * 100:.1f}%)', fg='red')
-            self.lbl_result.config(text='Biển số: —')
+            self.lbl_status.configure(text=f'NỀN/RÁC (Confidence: {confidence * 100:.1f}%)', text_color=self.C_DANGER)
+            self.lbl_result.configure(text='- - -')
+            self.result_frame.configure(border_color=self.C_BORDER)
             self.canvas.itemconfig(self.rect_id, outline='red')
 if __name__ == '__main__':
     try:
@@ -927,7 +1068,7 @@ if __name__ == '__main__':
         else:
             print('⚠️ OCR model không khả dụng — chỉ phát hiện biển số, không đọc ký tự.')
         print('🎨 Đang khởi tạo giao diện người dùng (GUI)...')
-        root = tk.Tk()
+        root = ctk.CTk()
         app = PlateDetectorGUI(root, model, scaler, ocr_model, ocr_scaler)
         print('✅ Giao diện đã sẵn sàng.')
         root.mainloop()

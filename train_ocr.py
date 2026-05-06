@@ -164,47 +164,38 @@ def cache_images(file_list):
     return cache
 
 def load_and_split_datasets(data_dirs, test_size=0.15, val_size=0.15, target=TARGET_PER_CLASS):
-    all_files = {cls_name: [] for cls_name in CLASS_NAMES}
+    split_paths = {'train': [], 'val': [], 'test': []}
+    split_labels = {'train': [], 'val': [], 'test': []}
+    split_map = {'train': 'train', 'valid': 'val', 'test': 'test'}
     for ddir in data_dirs:
         if not os.path.exists(ddir):
             print(f'  ⚠️  Thư mục không tồn tại: {ddir}')
             continue
-        for cls_name in CLASS_NAMES:
-            cls_dir = os.path.join(ddir, cls_name)
-            if os.path.isdir(cls_dir):
+        for folder_name, split_key in split_map.items():
+            split_dir = os.path.join(ddir, folder_name)
+            if not os.path.isdir(split_dir):
+                continue
+            for cls_idx, cls_name in enumerate(CLASS_NAMES):
+                cls_dir = os.path.join(split_dir, cls_name)
+                if not os.path.isdir(cls_dir):
+                    continue
                 flist = [os.path.join(cls_dir, f) for f in os.listdir(cls_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
-                all_files[cls_name].extend(flist)
-            else:
-                for sub in ['train', 'val', 'test']:
-                    sub_cls = os.path.join(ddir, sub, cls_name)
-                    if os.path.isdir(sub_cls):
-                        flist = [os.path.join(sub_cls, f) for f in os.listdir(sub_cls) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
-                        all_files[cls_name].extend(flist)
-    total = sum((len(v) for v in all_files.values()))
+                split_paths[split_key].extend(flist)
+                split_labels[split_key].extend([cls_idx] * len(flist))
+    total = sum(len(v) for v in split_paths.values())
     if total == 0:
         print('❌ Không tìm thấy dữ liệu nào!')
         return (None, None, None)
     print(f'\nTổng ảnh gốc: {total:,}')
-    print('\nPhân bố theo class:')
-    for cls_name in CLASS_NAMES:
-        n = len(all_files[cls_name])
-        bar = '█' * min(40, max(1, n // max(1, total // (40 * NUM_CLASSES))))
-        print(f'  {cls_name:>2}: {n:5d}  {bar}')
-    val_ratio = val_size / (1.0 - test_size) if test_size < 1.0 else 0.0
-    split_paths = {'train': [], 'val': [], 'test': []}
-    split_labels = {'train': [], 'val': [], 'test': []}
+    for split_key, display in [('train', 'TRAIN'), ('val', 'VAL'), ('test', 'TEST')]:
+        print(f'  {display}: {len(split_paths[split_key]):,} ảnh')
+    print('\nPhân bố theo class (train):')
+    from collections import Counter
+    train_counts = Counter(split_labels['train'])
     for cls_idx, cls_name in enumerate(CLASS_NAMES):
-        files = all_files[cls_name]
-        if not files:
-            continue
-        if len(files) > 5:
-            tv_fp, test_fp = train_test_split(files, test_size=test_size, random_state=42)
-            train_fp, val_fp = train_test_split(tv_fp, test_size=val_ratio, random_state=42)
-        else:
-            train_fp, val_fp, test_fp = (files, [], [])
-        for split_name, paths in [('train', train_fp), ('val', val_fp), ('test', test_fp)]:
-            split_paths[split_name].extend(paths)
-            split_labels[split_name].extend([cls_idx] * len(paths))
+        n = train_counts.get(cls_idx, 0)
+        bar = '█' * min(40, max(1, n // max(1, len(split_paths['train']) // (40 * NUM_CLASSES))))
+        print(f'  {cls_name:>2}: {n:5d}  {bar}')
     all_paths = split_paths['train'] + split_paths['val'] + split_paths['test']
     print(f'\n📂 Đang cache {len(all_paths):,} ảnh vào RAM...')
     t0 = time.time()
