@@ -634,8 +634,10 @@ class PlateDetectorGUI:
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=10)
         self.btn_load = tk.Button(top_frame, text='📁 Tải Ảnh', command=self.load_image, bg='#e0e0e0', font=('Arial', 10, 'bold'), padx=10)
         self.btn_load.pack(side=tk.LEFT, padx=5)
-        self.btn_auto = tk.Button(top_frame, text='🔍 Nhận diện Tự động', command=self.auto_detect, bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'), padx=10)
+        self.btn_auto = tk.Button(top_frame, text=' Nhận diện Tự động', command=self.auto_detect, bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'), padx=10)
         self.btn_auto.pack(side=tk.LEFT, padx=5)
+        self.btn_clear = tk.Button(top_frame, text='Xoá Detect', command=self.clear_detections, bg='#f44336', fg='white', font=('Arial', 10, 'bold'), padx=10)
+        self.btn_clear.pack(side=tk.LEFT, padx=5)
         self.lbl_status = tk.Label(top_frame, text='Vui lòng tải ảnh để bắt đầu. Ngưỡng mặc định: 85%', font=('Helvetica', 11), fg='blue', bg='#f0f0f0')
         self.lbl_status.pack(side=tk.LEFT, padx=20)
         self.fixed_confidence_threshold = 0.85
@@ -827,6 +829,18 @@ class PlateDetectorGUI:
         else:
             self.lbl_status.config(text=f'Tìm được {len(verified_results)} biển số', fg='green')
             self.lbl_result.config(text='Đã đọc: —')
+
+    def clear_detections(self):
+        if self.img_original is None:
+            return
+        self.canvas.delete('auto_box')
+        self.canvas.delete('auto_char_box')
+        self.canvas.delete('manual_char_box')
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+        self.lbl_status.config(text='Đã xoá các vùng nhận diện.', fg='black')
+        self.lbl_result.config(text='Biển số: —')
 
     def on_button_press(self, event):
         if self.img_original is None:
